@@ -1,0 +1,12 @@
+{
+	"flcap": {
+		"dpdkInPort": 0,
+		"dpdkOutPort": 1,
+		"cpuList": "0-71",
+		"dpdkArgs": ["-c 0xffffffffffffffffff", "-w 0000:d8:00.0", "-w 0000:d8:00.1"]
+	},
+	"flmk": {
+		"ip": "127.0.0.1",
+		"port": 4445
+	}
+}
