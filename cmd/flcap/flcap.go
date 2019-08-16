@@ -1,14 +1,16 @@
 package main
 
 import (
-	"time"
-
-	f "github.com/CSUNetSec/flowride"
 	"fmt"
-	"os"
+	f "github.com/CSUNetSec/flowride"
 	"github.com/intel-go/nff-go/common"
 	"github.com/intel-go/nff-go/flow"
 	"github.com/intel-go/nff-go/packet"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"strings"
 )
 
 const (
@@ -17,6 +19,7 @@ const (
 	ICMP
 )
 
+// splits the packets from a 32 vector input to 16 different flows. so 2 packets per flow)
 func vsplit(pkt []*packet.Packet, mask *[32]bool, res *[32]uint8, ctx flow.UserContext) {
 	for i := uint8(0); i < 2; i++ {
 		if (*mask)[i] {
@@ -50,65 +53,58 @@ func vsplit(pkt []*packet.Packet, mask *[32]bool, res *[32]uint8, ctx flow.UserC
 			(*res)[i+18] = uint8(9)
 		}
 		if (*mask)[i+20] {
-			(*res)[i+20] = uint8(9)
+			(*res)[i+20] = uint8(10)
 		}
 		if (*mask)[i+22] {
-			(*res)[i+22] = uint8(8)
+			(*res)[i+22] = uint8(11)
 		}
 		if (*mask)[i+24] {
-			(*res)[i+24] = uint8(7)
+			(*res)[i+24] = uint8(12)
 		}
 		if (*mask)[i+26] {
-			(*res)[i+26] = uint8(6)
+			(*res)[i+26] = uint8(13)
 		}
 		if (*mask)[i+28] {
-			(*res)[i+28] = uint8(5)
+			(*res)[i+28] = uint8(14)
 		}
 		if (*mask)[i+30] {
-			(*res)[i+30] = uint8(4)
+			(*res)[i+30] = uint8(15)
 		}
 	}
 }
 
-func genHandle(ind int) func([]*packet.Packet, *[32]bool, flow.UserContext) {
-	return func(pkt []*packet.Packet, mask *[32]bool, ctx flow.UserContext) {
-		for i := 0; i < 32; i++ {
-			if (*mask)[i] {
-				bufpos := (*privCnt)[ind] * 12 // index times 2 IPs + 2 ports
-				if bufpos >= bufsize-13 {      //one pair of IPs +  ports and a safe.
-					//fmt.Println("q: ", i, " reseting buffer!")
-					(*privCnt)[ind] = 0
-					bufpos = 0 // ahaha. edw itan.
-					time.Now()
+func pktHandler(pkt []*packet.Packet, mask *[32]bool, ctx flow.UserContext) {
+	fctx := ctx.(f.FlowrideContext)
+	pktBuf := <-fctx.BufChan
+	processed := uint64(0)
+	startind := pktBuf.Ind
+	var p f.PktCap
+	for i := 0; i < 32; i++ {
+		if (*mask)[i] {
+			pktIPv4, _, _ := pkt[i].ParseAllKnownL3()
+			if pktIPv4 != nil {
+				pktTCP, pktUDP, pktICMP := pkt[i].ParseAllKnownL4ForIPv4()
+				if pktTCP != nil {
+					p = f.PktCapFromBytes(pktIPv4.SrcAddr, pktIPv4.DstAddr, pktTCP.SrcPort, pktTCP.DstPort, 0, 0)
+				} else if pktUDP != nil {
+					p = f.PktCapFromBytes(pktIPv4.SrcAddr, pktIPv4.DstAddr, pktUDP.SrcPort, pktUDP.DstPort, 0, 0)
+				} else if pktICMP != nil {
+					p = f.PktCapFromBytes(pktIPv4.SrcAddr, pktIPv4.DstAddr, 0, 0, 0, 0)
 				}
-				pktIPv4, _, _ := pkt[i].ParseAllKnownL3()
-				if pktIPv4 != nil {
-					//pktTCP, pktUDP, pktICMP := pkt[i].ParseAllKnownL4ForIPv4()
-					pkt[i].ParseAllKnownL4ForIPv4()
-					(*privBufs)[ind][bufpos] = byte(pktIPv4.SrcAddr)
-					(*privBufs)[ind][bufpos+1] = byte(pktIPv4.SrcAddr >> 8)
-					(*privBufs)[ind][bufpos+2] = byte(pktIPv4.SrcAddr >> 16)
-					(*privBufs)[ind][bufpos+3] = byte(pktIPv4.SrcAddr >> 24)
-					(*privBufs)[ind][bufpos+4] = byte(pktIPv4.DstAddr)
-					(*privBufs)[ind][bufpos+5] = byte(pktIPv4.DstAddr >> 8)
-					(*privBufs)[ind][bufpos+6] = byte(pktIPv4.DstAddr >> 16)
-					(*privBufs)[ind][bufpos+7] = byte(pktIPv4.DstAddr >> 24)
-					//copy((*privBufs)[ind][bufpos], []byte{srcAddr, dstAddr, pktIPv4.SrcPort, pktIPv4.DstPort})
-					(*privCnt)[ind] = (*privCnt)[ind] + 1
+				if startind >= f.CAPBUFSIZE-32 {
+					f.LogFatal(fmt.Sprintf("ind is:%d processed:%d\n", pktBuf.Ind, processed))
 				}
+				pktBuf.Buf[startind+processed] = p
+				//		(*privCnt)[ppair][ind] = (*privCnt)[ppair][ind] + 1
+				processed++
 			}
 		}
 	}
+	fctx.IndChan <- processed
 }
 
-const (
-	bufsize = 1 << 15
-)
-
 var (
-	privCnt         *[10]uint64
-	privBufs        *[10][bufsize]byte
-	flconf		f.FlConf
+	flconf f.FlConf
 )
 
 func main() {
@@ -118,21 +114,55 @@ func main() {
 	flconf, err := f.ConfigFromFileName(os.Args[1])
 	f.CheckLogFatal(err)
 	fmt.Printf("config is :%v\n", flconf)
-	
+	conf := flconf.FlCapConf
+	if conf.Profiler {
+		fmt.Printf("starting profiler on localhost:6161")
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6161", nil))
+		}()
+	}
+	dpdkwlist := conf.DPDKArgs
+	for _, v := range append(conf.DpdkInPorts, conf.DpdkOutPorts...) {
+		dpdkwlist = append(dpdkwlist, "-w "+v)
+	}
+	if len(conf.DpdkInPorts) != len(conf.DpdkOutPorts) {
+		f.LogFatal("currently you should have the same numer of in and out ports")
+	}
 	config := flow.Config{
-		CPUList: flconf.FlCapConf.CpuList,
-		DPDKArgs: flconf.FlCapConf.DPDKArgs,
-		LogType: common.Debug,
+		CPUList:  flconf.FlCapConf.CpuList,
+		DPDKArgs: dpdkwlist,
+		LogType:  common.Debug,
 	}
+	fmt.Printf("\n DPDPKArgs: %v\n", dpdkwlist)
 	f.CheckLogFatal(flow.SystemInit(&config))
-	inFlow, err := flow.SetReceiver(uint16(flconf.FlCapConf.DpdkInPort))
-	f.CheckLogFatal(err)
-	sflows, _ := flow.SetVectorSplitter(inFlow, vsplit, 10, nil)
-	privCnt = &[10]uint64{}
-	privBufs = &[10][bufsize]byte{}
-	for i := range sflows {
-		flow.SetVectorHandler(sflows[i], genHandle(i), nil)
-		flow.SetSender(sflows[i], uint16(flconf.FlCapConf.DpdkOutPort))
+	fctx := f.NewFlowrideContext()
+
+	for i := 0; i < len(conf.DpdkInPorts); i++ {
+		fmt.Println("trying to get ", conf.DpdkInPorts[i])
+		inp, err := flow.GetPortByName(strings.Trim(conf.DpdkInPorts[i], " "))
+		fmt.Println("got ", inp, " err ", err)
+		//f.CheckLogFatal(err)
+		fmt.Println("trying to get ", conf.DpdkOutPorts[i])
+		outp, err := flow.GetPortByName(strings.Trim(conf.DpdkOutPorts[i], " "))
+		fmt.Println("got ", outp)
+		//f.CheckLogFatal(err)
+		// XXX HACK wtf is happening here
+		inp = 0
+		outp = 1
 	}
+
+	inFlow, err := flow.SetReceiver(0)
+	f.CheckLogFatal(err)
+	err = flow.SetVectorHandler(inFlow, pktHandler, fctx)
+	f.CheckLogFatal(err)
+	err = flow.SetSender(inFlow, 1)
+	f.CheckLogFatal(err)
+
+	inFlow1, err := flow.SetReceiver(2)
+	f.CheckLogFatal(err)
+	err = flow.SetVectorHandler(inFlow1, pktHandler, fctx)
+	f.CheckLogFatal(err)
+	err = flow.SetSender(inFlow1, 3)
+	f.CheckLogFatal(err)
 	f.CheckLogFatal(flow.SystemStart())
 }

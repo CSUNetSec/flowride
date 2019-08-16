@@ -12,10 +12,11 @@ type FlConf struct {
 }
 
 type FlCapConf struct {
-	DpdkInPort uint `json:"dpdkInPort"`
-	DpdkOutPort uint `json:"dpdkOutPort"`
+	DpdkInPorts []string `json:"dpdkInPorts"`
+	DpdkOutPorts []string `json:"dpdkOutPorts"`
 	CpuList     string `json:"cpuList"`
 	DPDKArgs    []string `json:"dpdkArgs"`
+	Profiler    bool `json:"profiler"`
 }
 
 type FlMkConf struct {
@@ -25,6 +26,8 @@ type FlMkConf struct {
 
 func ConfigFromFileName(a string) (FlConf, error) {
 	var ret FlConf
+	// by default keep the profiler off.
+	ret.Profiler = false
 	file, err := os.Open(a) 
 	if err != nil {
 		return ret, err
